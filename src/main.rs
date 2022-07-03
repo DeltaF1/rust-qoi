@@ -108,7 +108,9 @@ fn decode(qoi: &[u8]) -> Result<Vec<u8>, QOIError> {
     }; 64];
     let mut output = vec![];
 
-    let mut iter = qoi.iter();
+    let mut iter = qoi
+        .iter()
+        .skip(14); // Skip over the header for now
 
     while let Some(qoi_byte) = iter.next() {
         let op: Op = (*qoi_byte).into();
