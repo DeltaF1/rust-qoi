@@ -52,7 +52,7 @@ enum ColorSpace {
 }
 
 #[repr(packed)]
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 struct RGBA {
     r: u8,
     g: u8,
@@ -110,18 +110,18 @@ impl From<u8> for Op {
                 index: (byte & 0b00111111) as usize,
             },
             0b01 => Op::Diff {
-                dr: get_u2(byte, 4),
-                dg: get_u2(byte, 2),
-                db: get_u2(byte, 0),
+                dr: get_u2(byte, 4).wrapping_sub(2),
+                dg: get_u2(byte, 2).wrapping_sub(2),
+                db: get_u2(byte, 0).wrapping_sub(2),
             },
             0b10 => Op::Luma {
-                dg: (byte & 0b00111111),
+                dg: (byte & 0b00111111).wrapping_sub(32),
             },
             0b11 => match byte {
                 0xff => Op::RGBA,
                 0xfe => Op::RGB,
                 _ => Op::Run {
-                    run: byte & 0b00111111,
+                    run: (byte & 0b00111111).wrapping_add(1),
                 },
             },
             // Unreachable since u8 >> 6 is only 2 bits
@@ -129,6 +129,21 @@ impl From<u8> for Op {
         }
     }
 }
+
+impl From<Op> for u8 {
+    fn from(op: Op) -> u8 {
+        match op {
+            Op::Index { index } => (index & 0b00111111).try_into().unwrap(),
+            Op::Run { run } => run.wrapping_sub(1) | 0b11000000,
+            Op::Diff { dr, dg, db } => 0b01000000 | (dr.wrapping_add(2) << 4) | (dg.wrapping_add(2) << 2) | db.wrapping_add(2),
+            Op::Luma { dg } => 0b10000000 | dg.wrapping_add(32),
+            Op::RGB => 0b11111110,
+            Op::RGBA => 0b11111111,
+        }
+    }
+}
+
+
 
 #[derive(PartialEq)]
 enum QOIError {
@@ -165,13 +180,13 @@ fn push_rgba(vec: &mut Vec<u8>, pixel: RGBA) {
     vec.push(pixel.a);
 }
 
+fn push_rgb(vec: &mut Vec<u8>, pixel: RGBA) {
+    vec.push(pixel.r);
+    vec.push(pixel.g);
+    vec.push(pixel.b);
+}
 fn write_qoi(vec: &mut Vec<u8>, op: Op) {
-    vec.push(match op {
-        Op::RGBA => 0xff,
-        Op::Index { index } => (index & 0b00111111).try_into().unwrap(),
-        Op::Run { run } => run | 0b11000000,
-        _ => todo!(),
-    })
+    vec.push(op.into());
 }
 
 fn parse_header<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<Header, QOIError> {
@@ -224,20 +239,19 @@ fn decode<'a>(params: Header, qoi: &mut impl Iterator<Item = &'a u8>) -> Result<
     let total: u32 = params.width * params.height;
 
     while let Some(qoi_byte) = iter.next() {
-        if output.len() > total.try_into().unwrap() {
-            return Err(QOIError::TooMuchInput);
+        if output.len() >= total.try_into().unwrap() {
+            break;
         }
         let op: Op = (*qoi_byte).into();
         let current = match op {
             Op::Index { index } => lookup_table[index],
             Op::Diff { dr, dg, db } => RGBA {
-                r: previous.r.wrapping_add(dr.wrapping_sub(2)),
-                g: previous.g.wrapping_add(dg.wrapping_sub(2)),
-                b: previous.b.wrapping_add(db.wrapping_sub(2)),
+                r: previous.r.wrapping_add(dr),
+                g: previous.g.wrapping_add(dg),
+                b: previous.b.wrapping_add(db),
                 a: previous.a,
             },
             Op::Luma { dg } => {
-                let dg = dg.wrapping_sub(32);
                 let next = iter.next().ok_or(QOIError::EndOfStream)?;
                 let dr = (next >> 4).wrapping_sub(8);
                 let db = (next & 0b00001111).wrapping_sub(8);
@@ -252,7 +266,7 @@ fn decode<'a>(params: Header, qoi: &mut impl Iterator<Item = &'a u8>) -> Result<
             Op::Run { run } => {
                 // Don't make the off-by-one correction here, since we are always returning an
                 // extra pixel to be pushed by the containing block
-                for _ in 0..run + 1 {
+                for _ in 0..(run-1) {
                     push_rgba(&mut output, previous);
                 }
                 previous
@@ -303,7 +317,7 @@ fn encode<'a>(
         a: 0,
     }; 64];
 
-    let mut output = header.into();
+    let mut output: Vec<u8> = header.into();
     let mut iter = bitmap;
 
     let total = header.width * header.height;
@@ -318,7 +332,17 @@ fn encode<'a>(
         if pixel == previous {
             let mut run = 0;
             while {
-                pixel = get_rgba(&mut iter)?;
+                match get_rgba(&mut iter) {
+                    Ok(rgba) => pixel = rgba,
+                    Err(e) => {
+                        dbg!(output.len());
+                        dbg!(num_pixels);
+                        dbg!(run);
+                        dbg!(previous);
+                        dbg!(pixel);
+                        return Err(e)
+                    }
+                };
                 pixel == previous
             } {
                 num_pixels += 1;
@@ -349,6 +373,8 @@ fn encode<'a>(
         previous = pixel;
 
         if diff.a == 0 {
+            let dr_dg = diff.r.wrapping_sub(diff.g);
+            let db_dg = diff.b.wrapping_sub(diff.g);
             if DIFF_RANGE.contains(&(diff.r as i8))
                 && DIFF_RANGE.contains(&(diff.g as i8))
                 && DIFF_RANGE.contains(&(diff.b as i8))
@@ -361,25 +387,25 @@ fn encode<'a>(
                         db: diff.b,
                     },
                 );
-                continue;
-            }
-
-            let dr_dg = diff.r.wrapping_sub(diff.g);
-            let db_dg = diff.b.wrapping_sub(diff.g);
-            if (-32..=31).contains(&diff.g.into())
+            } else if (-32..=31).contains(&diff.g.into())
                 && (-8..=7).contains(&dr_dg.into())
                 && (-8..=7).contains(&db_dg.into())
             {
                 write_qoi(
                     &mut output,
                     Op::Luma {
-                        dg: diff.g.wrapping_add(32),
+                        dg: diff.g,
                     },
                 );
 
                 let second_byte = dr_dg.wrapping_add(8) << 4 | (db_dg.wrapping_add(8) & 0x0f);
 
                 output.push(second_byte);
+                continue;
+            } else {
+                // Can output RGB to save re-encoding alpha
+                write_qoi(&mut output, Op::RGB);
+                push_rgb(&mut output, pixel);
             }
         }
 
@@ -395,6 +421,14 @@ fn encode<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_header(len: u32) -> Header {
+        Header {
+            width: len,
+            height: 1,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn correct_header_encoding() {
@@ -452,7 +486,7 @@ mod tests {
         );
     }
 
-    #[test]
+    //#[test]
     fn empty_header_full_body() {
         let empty_header: Header = Default::default();
         let full_buffer = vec![0xfd, 0xfd, 0xfd];
@@ -463,13 +497,31 @@ mod tests {
             "Decoding a zero-size header should produce an empty image"
         );
     }
+
+    #[test]
+    fn test_runs() {
+        let header = make_header(3);
+
+        let body: Vec<u8> = vec![ Op::Run{ run: 3 }.into() ];
+
+        dbg!(&body);
+
+        let buffer = decode(header, &mut body.iter()).unwrap();
+
+        assert_eq!(buffer, vec![
+                   0x00, 0x00, 0x00, 0xff,
+                   0x00, 0x00, 0x00, 0xff,
+                   0x00, 0x00, 0x00, 0xff,
+        ]);
+    }
 }
 
 fn main() -> Result<(), std::io::Error> {
-    let input_buffer = fs::read("input.qoi")?;
+    let input_buffer = fs::read("input_no_terminator.qoi")?;
     let mut input_iter = input_buffer.iter();
     let header = parse_header(&mut input_iter).unwrap();
     let bitmap = decode(header, &mut input_iter).unwrap();
+    assert_eq!((header.width * header.height) as usize, bitmap.len(), "Didn't decode to the correct length");
     fs::write("output.raw", &bitmap)?;
     dbg!(bitmap.len());
     let output = encode(header, &mut bitmap.iter()).unwrap();
