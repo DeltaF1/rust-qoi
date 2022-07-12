@@ -60,6 +60,19 @@ struct RGBA {
     a: u8,
 }
 
+impl std::ops::Sub for RGBA {
+    type Output = RGBA;
+
+    fn sub(self, rhs: RGBA) -> RGBA {
+        RGBA {
+            r: self.r.wrapping_sub(rhs.r),
+            g: self.g.wrapping_sub(rhs.g),
+            b: self.b.wrapping_sub(rhs.b),
+            a: self.a.wrapping_sub(rhs.a),
+        }
+    }
+}
+
 #[allow(non_camel_case_types)]
 type u6 = u8;
 #[allow(non_camel_case_types)]
@@ -86,6 +99,8 @@ enum Op {
     RGB,
     RGBA,
 }
+
+const DIFF_RANGE: std::ops::RangeInclusive<i8> = -2..=1;
 
 impl From<u8> for Op {
     fn from(byte: u8) -> Op {
@@ -126,13 +141,20 @@ enum QOIError {
 
 impl std::fmt::Debug for QOIError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}", match self {
-            QOIError::EndOfStream  => "Expected more input",
-            QOIError::TooMuchInput => "Did not expect any more input",
-            QOIError::MissingMagic  => "Expected header to start with the 4-byte ASCII literal 'qoif'",
-            QOIError::InvalidChannelSpec  => "Invalid number of channels, expected RGB (3) or RGBA (4)",
-            QOIError::InvalidColorSpaceSpec  => "Invalid color space, expected sRGB (0) or linear (1)", // TODO: Capture the invalid byte in enum
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                QOIError::EndOfStream => "Expected more input",
+                QOIError::TooMuchInput => "Did not expect any more input",
+                QOIError::MissingMagic =>
+                    "Expected header to start with the 4-byte ASCII literal 'qoif'",
+                QOIError::InvalidChannelSpec =>
+                    "Invalid number of channels, expected RGB (3) or RGBA (4)",
+                QOIError::InvalidColorSpaceSpec =>
+                    "Invalid color space, expected sRGB (0) or linear (1)", // TODO: Capture the invalid byte in enum
+            }
+        )
     }
 }
 
@@ -203,7 +225,7 @@ fn decode<'a>(params: Header, qoi: &mut impl Iterator<Item = &'a u8>) -> Result<
 
     while let Some(qoi_byte) = iter.next() {
         if output.len() > total.try_into().unwrap() {
-            return Err(QOIError::TooMuchInput)
+            return Err(QOIError::TooMuchInput);
         }
         let op: Op = (*qoi_byte).into();
         let current = match op {
@@ -313,7 +335,6 @@ fn encode<'a>(
                 write_qoi(&mut output, Op::Run { run: run - 1 });
             }
         }
-        previous = pixel;
 
         let index = hash(pixel);
         if lookup_table[index] == pixel {
@@ -321,10 +342,50 @@ fn encode<'a>(
             continue;
         }
 
+        lookup_table[index] = pixel;
+
+        let diff = pixel - previous;
+
+        previous = pixel;
+
+        if diff.a == 0 {
+            if DIFF_RANGE.contains(&(diff.r as i8))
+                && DIFF_RANGE.contains(&(diff.g as i8))
+                && DIFF_RANGE.contains(&(diff.b as i8))
+            {
+                write_qoi(
+                    &mut output,
+                    Op::Diff {
+                        dr: diff.r,
+                        dg: diff.g,
+                        db: diff.b,
+                    },
+                );
+                continue;
+            }
+
+            let dr_dg = diff.r.wrapping_sub(diff.g);
+            let db_dg = diff.b.wrapping_sub(diff.g);
+            if (-32..=31).contains(&diff.g.into())
+                && (-8..=7).contains(&dr_dg.into())
+                && (-8..=7).contains(&db_dg.into())
+            {
+                write_qoi(
+                    &mut output,
+                    Op::Luma {
+                        dg: diff.g.wrapping_add(32),
+                    },
+                );
+
+                let second_byte = dr_dg.wrapping_add(8) << 4 | (db_dg.wrapping_add(8) & 0x0f);
+
+                output.push(second_byte);
+            }
+        }
+
+        // If nothing else works, encode the whole pixel
         write_qoi(&mut output, Op::RGBA);
         push_rgba(&mut output, pixel);
-
-        lookup_table[index] = pixel;
     }
 
     output.extend(vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
@@ -384,7 +445,11 @@ mod tests {
         let empty_header: Header = Default::default();
         let empty_buffer = vec![];
         let decoded = decode(empty_header, &mut empty_buffer.iter()).unwrap();
-        assert_eq!(decoded.len(), 0, "Decoding a zero-size header should produce an empty image");
+        assert_eq!(
+            decoded.len(),
+            0,
+            "Decoding a zero-size header should produce an empty image"
+        );
     }
 
     #[test]
@@ -392,7 +457,11 @@ mod tests {
         let empty_header: Header = Default::default();
         let full_buffer = vec![0xfd, 0xfd, 0xfd];
         let decoded = decode(empty_header, &mut full_buffer.iter());
-        assert_eq!(decoded, Err(QOIError::TooMuchInput), "Decoding a zero-size header should produce an empty image");
+        assert_eq!(
+            decoded,
+            Err(QOIError::TooMuchInput),
+            "Decoding a zero-size header should produce an empty image"
+        );
     }
 }
 
