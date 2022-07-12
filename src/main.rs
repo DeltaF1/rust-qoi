@@ -8,17 +8,47 @@ struct Header {
     colorspace: ColorSpace,
 }
 
+impl Default for Header {
+    fn default() -> Header {
+        Header {
+            width: 0,
+            height: 0,
+            channels: Channels::RGBA,
+            colorspace: ColorSpace::Linear,
+        }
+    }
+}
+
+impl From<Header> for Vec<u8> {
+    fn from(header: Header) -> Vec<u8> {
+        let mut v = vec![b'q', b'o', b'i', b'f'];
+        v.extend(header.width.to_be_bytes());
+        v.extend(header.height.to_be_bytes());
+        v.push(header.channels as u8);
+        v.push(header.colorspace as u8);
+        v
+    }
+}
+/*
+impl Into<Vec<u8>> for Header {
+    fn into(self: Header) -> Vec<u8> {
+       }
+}
+*/
+
 #[derive(Clone, Copy)]
+#[repr(u8)]
 enum Channels {
-    RGB,
-    RGBA,
+    RGB = 3,
+    RGBA = 4,
 }
 
 #[derive(Clone, Copy)]
 #[allow(non_camel_case_types)]
+#[repr(u8)]
 enum ColorSpace {
-    sRGB,
-    Linear,
+    sRGB = 0,
+    Linear = 1,
 }
 
 #[repr(packed)]
@@ -85,12 +115,25 @@ impl From<u8> for Op {
     }
 }
 
-#[derive(Debug)]
+#[derive(PartialEq)]
 enum QOIError {
     EndOfStream,
+    TooMuchInput,
     MissingMagic,
     InvalidChannelSpec,
     InvalidColorSpaceSpec,
+}
+
+impl std::fmt::Debug for QOIError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "{}", match self {
+            QOIError::EndOfStream  => "Expected more input",
+            QOIError::TooMuchInput => "Did not expect any more input",
+            QOIError::MissingMagic  => "Expected header to start with the 4-byte ASCII literal 'qoif'",
+            QOIError::InvalidChannelSpec  => "Invalid number of channels, expected RGB (3) or RGBA (4)",
+            QOIError::InvalidColorSpaceSpec  => "Invalid color space, expected sRGB (0) or linear (1)", // TODO: Capture the invalid byte in enum
+        })
+    }
 }
 
 fn push_rgba(vec: &mut Vec<u8>, pixel: RGBA) {
@@ -156,7 +199,12 @@ fn decode<'a>(params: Header, qoi: &mut impl Iterator<Item = &'a u8>) -> Result<
 
     let iter = qoi;
 
+    let total: u32 = params.width * params.height;
+
     while let Some(qoi_byte) = iter.next() {
+        if output.len() > total.try_into().unwrap() {
+            return Err(QOIError::TooMuchInput)
+        }
         let op: Op = (*qoi_byte).into();
         let current = match op {
             Op::Index { index } => lookup_table[index],
@@ -233,12 +281,7 @@ fn encode<'a>(
         a: 0,
     }; 64];
 
-    let mut output = vec![b'q', b'o', b'i', b'f'];
-    output.extend(header.width.to_be_bytes());
-    output.extend(header.height.to_be_bytes());
-    output.push(4);
-    output.push(0);
-
+    let mut output = header.into();
     let mut iter = bitmap;
 
     let total = header.width * header.height;
@@ -290,11 +333,67 @@ fn encode<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    fn decoded_length() {
-        let qoi: Vec<u8> = vec!['q', 'o', 'i', 'f'];
+    #[test]
+    fn correct_header_encoding() {
+        assert_eq!(
+            Into::<Vec<u8>>::into(Header {
+                width: 0,
+                height: 0,
+                channels: Channels::RGBA,
+                colorspace: ColorSpace::Linear,
+            }),
+            b"qoif\
+            \x00\x00\x00\x00\
+            \x00\x00\x00\x00\
+            \x04\x01"
+        );
+
+        assert_eq!(
+            Into::<Vec<u8>>::into(Header {
+                width: 65535,
+                height: u32::MAX - 1,
+                channels: Channels::RGBA,
+                colorspace: ColorSpace::Linear,
+            }),
+            b"qoif\
+            \x00\x00\xff\xff\
+            \xff\xff\xff\xfe\
+            \x04\x01",
+            "Incorrect endian-ness"
+        );
+
+        assert_eq!(
+            Into::<Vec<u8>>::into(Header {
+                width: 0,
+                height: 0,
+                channels: Channels::RGB,
+                colorspace: ColorSpace::sRGB,
+            }),
+            b"qoif\
+            \x00\x00\x00\x00\
+            \x00\x00\x00\x00\
+            \x03\x00",
+            "Incorrect color information encoding"
+        );
     }
-    assert_eq!();
+
+    #[test]
+    fn empty_header_empty_body() {
+        let empty_header: Header = Default::default();
+        let empty_buffer = vec![];
+        let decoded = decode(empty_header, &mut empty_buffer.iter()).unwrap();
+        assert_eq!(decoded.len(), 0, "Decoding a zero-size header should produce an empty image");
+    }
+
+    #[test]
+    fn empty_header_full_body() {
+        let empty_header: Header = Default::default();
+        let full_buffer = vec![0xfd, 0xfd, 0xfd];
+        let decoded = decode(empty_header, &mut full_buffer.iter());
+        assert_eq!(decoded, Err(QOIError::TooMuchInput), "Decoding a zero-size header should produce an empty image");
+    }
 }
 
 fn main() -> Result<(), std::io::Error> {
