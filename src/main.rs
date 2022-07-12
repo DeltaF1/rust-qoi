@@ -1,5 +1,6 @@
 use std::fs;
 
+#[derive(Clone, Copy)]
 struct Header {
     width: u32,
     height: u32,
@@ -7,11 +8,13 @@ struct Header {
     colorspace: ColorSpace,
 }
 
+#[derive(Clone, Copy)]
 enum Channels {
     RGB,
     RGBA,
 }
 
+#[derive(Clone, Copy)]
 #[allow(non_camel_case_types)]
 enum ColorSpace {
     sRGB,
@@ -19,7 +22,7 @@ enum ColorSpace {
 }
 
 #[repr(packed)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 struct RGBA {
     r: u8,
     g: u8,
@@ -27,7 +30,9 @@ struct RGBA {
     a: u8,
 }
 
+#[allow(non_camel_case_types)]
 type u6 = u8;
+#[allow(non_camel_case_types)]
 type u2 = u8;
 type Index = usize;
 
@@ -83,6 +88,9 @@ impl From<u8> for Op {
 #[derive(Debug)]
 enum QOIError {
     EndOfStream,
+    MissingMagic,
+    InvalidChannelSpec,
+    InvalidColorSpaceSpec,
 }
 
 fn push_rgba(vec: &mut Vec<u8>, pixel: RGBA) {
@@ -92,8 +100,46 @@ fn push_rgba(vec: &mut Vec<u8>, pixel: RGBA) {
     vec.push(pixel.a);
 }
 
-// Change this to an iterator API
-fn decode(qoi: &[u8]) -> Result<Vec<u8>, QOIError> {
+fn write_qoi(vec: &mut Vec<u8>, op: Op) {
+    vec.push(match op {
+        Op::RGBA => 0xff,
+        Op::Index { index } => (index & 0b00111111).try_into().unwrap(),
+        Op::Run { run } => run | 0b11000000,
+        _ => todo!(),
+    })
+}
+
+fn parse_header<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<Header, QOIError> {
+    let magic = bytes.by_ref().take(4).cloned().collect::<Vec<u8>>();
+    if magic.len() != 4 {
+        return Err(QOIError::EndOfStream);
+    };
+    if magic != b"qoif" {
+        return Err(QOIError::MissingMagic);
+    };
+
+    let header_bytes = bytes.by_ref().take(10).cloned().collect::<Vec<u8>>();
+    if header_bytes.len() != 10 {
+        return Err(QOIError::EndOfStream);
+    }
+    return Ok(Header {
+        width: u32::from_be_bytes(header_bytes[0..4].try_into().unwrap()),
+        height: u32::from_be_bytes(header_bytes[4..8].try_into().unwrap()),
+        channels: match header_bytes[8] {
+            3 => Channels::RGB,
+            4 => Channels::RGBA,
+            _ => return Err(QOIError::InvalidChannelSpec),
+        },
+        colorspace: match header_bytes[9] {
+            0 => ColorSpace::sRGB,
+            1 => ColorSpace::Linear,
+            _ => return Err(QOIError::InvalidColorSpaceSpec),
+        },
+    });
+}
+
+// TODO: Change this to an iterator API
+fn decode<'a>(params: Header, qoi: &mut impl Iterator<Item = &'a u8>) -> Result<Vec<u8>, QOIError> {
     let mut previous = RGBA {
         r: 0,
         g: 0,
@@ -108,7 +154,7 @@ fn decode(qoi: &[u8]) -> Result<Vec<u8>, QOIError> {
     }; 64];
     let mut output = vec![];
 
-    let mut iter = qoi.iter().skip(14); // Skip over the header for now
+    let iter = qoi;
 
     while let Some(qoi_byte) = iter.next() {
         let op: Op = (*qoi_byte).into();
@@ -136,7 +182,7 @@ fn decode(qoi: &[u8]) -> Result<Vec<u8>, QOIError> {
             Op::Run { run } => {
                 // Don't make the off-by-one correction here, since we are always returning an
                 // extra pixel to be pushed by the containing block
-                for _ in 0..run {
+                for _ in 0..run + 1 {
                     push_rgba(&mut output, previous);
                 }
                 previous
@@ -161,12 +207,104 @@ fn decode(qoi: &[u8]) -> Result<Vec<u8>, QOIError> {
     Ok(output)
 }
 
-fn encode(bitmap: &[u8]) -> &[u8] {
-    todo!()
+fn get_rgba<'a>(iter: &mut impl Iterator<Item = &'a u8>) -> Result<RGBA, QOIError> {
+    Ok(RGBA {
+        r: *iter.next().ok_or(QOIError::EndOfStream)?,
+        g: *iter.next().ok_or(QOIError::EndOfStream)?,
+        b: *iter.next().ok_or(QOIError::EndOfStream)?,
+        a: *iter.next().ok_or(QOIError::EndOfStream)?,
+    })
+}
+
+fn encode<'a>(
+    header: Header,
+    bitmap: &mut impl Iterator<Item = &'a u8>,
+) -> Result<Vec<u8>, QOIError> {
+    let mut previous = RGBA {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 255,
+    };
+    let mut lookup_table = [RGBA {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 0,
+    }; 64];
+
+    let mut output = vec![b'q', b'o', b'i', b'f'];
+    output.extend(header.width.to_be_bytes());
+    output.extend(header.height.to_be_bytes());
+    output.push(4);
+    output.push(0);
+
+    let mut iter = bitmap;
+
+    let total = header.width * header.height;
+    println!("total pixels to encode: {}", total);
+    let mut num_pixels = 0;
+    'outer: loop {
+        if num_pixels == total {
+            break;
+        }
+        let mut pixel = get_rgba(&mut iter).unwrap();
+        num_pixels += 1;
+        if pixel == previous {
+            let mut run = 0;
+            while {
+                pixel = get_rgba(&mut iter)?;
+                pixel == previous
+            } {
+                num_pixels += 1;
+                run += 1;
+                if num_pixels == total {
+                    break 'outer;
+                }
+                if run == 61 {
+                    write_qoi(&mut output, Op::Run { run });
+                    run = 0;
+                }
+            }
+            if run > 0 {
+                write_qoi(&mut output, Op::Run { run: run - 1 });
+            }
+        }
+        previous = pixel;
+
+        let index = hash(pixel);
+        if lookup_table[index] == pixel {
+            write_qoi(&mut output, Op::Index { index });
+            continue;
+        }
+
+        write_qoi(&mut output, Op::RGBA);
+        push_rgba(&mut output, pixel);
+
+        lookup_table[index] = pixel;
+    }
+
+    output.extend(vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+
+    fn decoded_length() {
+        let qoi: Vec<u8> = vec!['q', 'o', 'i', 'f'];
+    }
+    assert_eq!();
 }
 
 fn main() -> Result<(), std::io::Error> {
-    let input = fs::read("input.qoi")?;
-    fs::write("output.raw", decode(&input).expect("QOIError")).expect("Unable to write file");
+    let input_buffer = fs::read("input.qoi")?;
+    let mut input_iter = input_buffer.iter();
+    let header = parse_header(&mut input_iter).unwrap();
+    let bitmap = decode(header, &mut input_iter).unwrap();
+    fs::write("output.raw", &bitmap)?;
+    dbg!(bitmap.len());
+    let output = encode(header, &mut bitmap.iter()).unwrap();
+    fs::write("output.qoi", output).expect("Unable to write file");
     Ok(())
 }
