@@ -1,8 +1,7 @@
-use qoi;
 use std::fs;
 
 fn main() -> Result<(), std::io::Error> {
-    let input_buffer = fs::read("input_no_terminator.qoi")?;
+    let input_buffer = fs::read("input.qoi")?;
     let mut input_iter = input_buffer.iter();
     let header = qoi::parse_header(&mut input_iter).unwrap();
     dbg!(&header);
