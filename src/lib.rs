@@ -337,41 +337,32 @@ pub fn encode<'a>(
     let mut num_pixels = 0;
     'outer: loop {
         if num_pixels == total {
+            println!("Early break!");
+            println!("{} left in iter", iter.count());
             break;
         }
-        let mut pixel = get_rgba(&mut iter).unwrap();
-        num_pixels += 1;
-        if pixel == previous {
-            let mut run = 0;
-            while {
-                match get_rgba(&mut iter) {
-                    Ok(rgba) => pixel = rgba,
-                    Err(e) => {
-                        dbg!(output.len());
-                        dbg!(num_pixels);
-                        dbg!(run);
-                        dbg!(previous);
-                        dbg!(pixel);
-                        return Err(e);
-                    }
-                };
-                pixel == previous
-            } {
-                num_pixels += 1;
-                run += 1;
-                if num_pixels == total {
-                    break 'outer;
-                }
-                if run == 61 {
-                    write_qoi(&mut output, Op::Run { run });
-                    run = 0;
-                }
+        let mut pixel = match get_rgba(&mut iter) {
+            Ok(p) => p,
+            Err(e) => {
+                dbg!(num_pixels);
+                return Err(e);
             }
-            if run > 0 {
-                write_qoi(&mut output, Op::Run { run: run - 1 });
-            }
+        };
+
+        let mut run = 0;
+        while pixel == previous {
+            pixel = get_rgba(&mut iter)?;
+            run += 1;
         }
 
+        while run > 0 {
+            let amt = u32::min(62, run);
+            write_qoi(&mut output, Op::Run { run: amt as u8 });
+            num_pixels += amt;
+            run = run - amt;
+        }
+
+        num_pixels += 1;
         let index = hash(pixel);
         if lookup_table[index] == pixel {
             write_qoi(&mut output, Op::Index { index });
