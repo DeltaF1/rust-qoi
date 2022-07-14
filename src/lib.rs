@@ -72,20 +72,12 @@ impl std::ops::Sub for RGBA {
     }
 }
 
-#[allow(non_camel_case_types)]
-type i6 = i8;
-#[allow(non_camel_case_types)]
-type u6 = u8;
-#[allow(non_camel_case_types)]
-type i2 = i8;
-type Index = usize;
-
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Op {
-    Index { index: Index },
-    Diff { dr: i2, dg: i2, db: i2 },
-    Luma { dg: i6 },
-    Run { run: u6 },
+    Index { index: usize },
+    Diff { dr: i8, dg: i8, db: i8 },
+    Luma { dg: i8 },
+    Run { run: u8 },
     RGB,
     RGBA,
 }
@@ -139,6 +131,7 @@ impl From<Op> for u8 {
 #[derive(PartialEq)]
 pub enum QOIError {
     EndOfStream,
+    UnalignedRGBA,
     TooMuchInput,
     MissingMagic,
     InvalidChannelSpec,
@@ -159,6 +152,7 @@ impl std::fmt::Debug for QOIError {
                     "Invalid number of channels, expected RGB (3) or RGBA (4)",
                 QOIError::InvalidColorSpaceSpec =>
                     "Invalid color space, expected sRGB (0) or linear (1)", // TODO: Capture the invalid byte in enum
+                                                                                    QOIError::UnalignedRGBA => "Input was not aligned to 4-byte RGBA",
             }
         )
     }
@@ -174,7 +168,7 @@ fn get_2bits(byte: u8, offset: u8) -> u8 {
     (byte >> offset) & 0b11
 }
 
-fn hash(pixel: RGBA) -> Index {
+fn hash(pixel: RGBA) -> usize {
     ((pixel.r.wrapping_mul(3)).wrapping_add(
         (pixel.g.wrapping_mul(5))
             .wrapping_add((pixel.b.wrapping_mul(7)).wrapping_add(pixel.a.wrapping_mul(11))),
@@ -303,13 +297,20 @@ pub fn decode<'a>(
     Ok(output)
 }
 
-fn get_rgba<'a>(iter: &mut impl Iterator<Item = &'a u8>) -> Result<RGBA, QOIError> {
-    Ok(RGBA {
-        r: *iter.next().ok_or(QOIError::EndOfStream)?,
-        g: *iter.next().ok_or(QOIError::EndOfStream)?,
-        b: *iter.next().ok_or(QOIError::EndOfStream)?,
-        a: *iter.next().ok_or(QOIError::EndOfStream)?,
-    })
+fn get_rgba<'a>(iter: &mut impl Iterator<Item = &'a u8>) -> Result<Option<RGBA>, QOIError> {
+    // If there is nothing left in the iterator, then return None
+    let r = iter.next();
+    if r.is_none() {
+        return Ok(None);
+    }
+
+    // Otherwise return an EndOfStream error to indicate that the stream is malformed
+    Ok(Some(RGBA {
+        r: *r.unwrap(),
+        g: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
+        b: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
+        a: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
+    }))
 }
 
 pub fn encode<'a>(
@@ -335,23 +336,23 @@ pub fn encode<'a>(
     let total = header.width * header.height;
     println!("total pixels to encode: {}", total);
     let mut num_pixels = 0;
-    'outer: loop {
-        if num_pixels == total {
+    loop {
+        if num_pixels >= total {
             println!("Early break!");
             println!("{} left in iter", iter.count());
             break;
         }
-        let mut pixel = match get_rgba(&mut iter) {
-            Ok(p) => p,
-            Err(e) => {
-                dbg!(num_pixels);
-                return Err(e);
+        let mut pixel = match get_rgba(&mut iter)? {
+            Some(p) => p,
+            None => {
+                return Err(QOIError::EndOfStream);
             }
         };
 
         let mut run = 0;
-        while pixel == previous {
-            pixel = get_rgba(&mut iter)?;
+        let mut next = Some(pixel);
+        while next.is_some() && next.unwrap() == previous {
+            next = get_rgba(&mut iter)?;
             run += 1;
         }
 
@@ -362,6 +363,14 @@ pub fn encode<'a>(
             run = run - amt;
         }
 
+        match next {
+            Some(px) => pixel = px,
+            None => break
+        }
+
+        let diff = pixel - previous;
+        previous = pixel;
+
         num_pixels += 1;
         let index = hash(pixel);
         if lookup_table[index] == pixel {
@@ -370,10 +379,6 @@ pub fn encode<'a>(
         }
 
         lookup_table[index] = pixel;
-
-        let diff = pixel - previous;
-
-        previous = pixel;
 
         if diff.da == 0 {
             let dr_dg = diff.dr.wrapping_sub(diff.dg);
@@ -400,17 +405,16 @@ pub fn encode<'a>(
                     (dr_dg as u8).wrapping_add(8) << 4 | ((db_dg as u8).wrapping_add(8) & 0x0f);
 
                 output.push(second_byte);
-                continue;
             } else {
-                // Can output RGB to save re-encoding alpha
+                // Can output RGB only to save re-encoding alpha
                 write_qoi(&mut output, Op::RGB);
                 push_rgb(&mut output, pixel);
             }
+        } else {
+            // If nothing else works, encode the whole pixel
+            write_qoi(&mut output, Op::RGBA);
+            push_rgba(&mut output, pixel);
         }
-
-        // If nothing else works, encode the whole pixel
-        write_qoi(&mut output, Op::RGBA);
-        push_rgba(&mut output, pixel);
     }
 
     output.extend(vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
