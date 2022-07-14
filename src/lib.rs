@@ -152,7 +152,7 @@ impl std::fmt::Debug for QOIError {
                     "Invalid number of channels, expected RGB (3) or RGBA (4)",
                 QOIError::InvalidColorSpaceSpec =>
                     "Invalid color space, expected sRGB (0) or linear (1)", // TODO: Capture the invalid byte in enum
-                                                                                    QOIError::UnalignedRGBA => "Input was not aligned to 4-byte RGBA",
+                QOIError::UnalignedRGBA => "Input was not aligned to 4-byte RGBA",
             }
         )
     }
@@ -360,12 +360,12 @@ pub fn encode<'a>(
             let amt = u32::min(62, run);
             write_qoi(&mut output, Op::Run { run: amt as u8 });
             num_pixels += amt;
-            run = run - amt;
+            run -= amt;
         }
 
         match next {
             Some(px) => pixel = px,
-            None => break
+            None => break,
         }
 
         let diff = pixel - previous;
