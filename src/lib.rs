@@ -45,6 +45,7 @@ pub enum ColorSpace {
 
 #[repr(packed)]
 #[derive(Copy, Clone, PartialEq, Debug)]
+#[allow(clippy::upper_case_acronyms)]
 struct RGBA {
     r: u8,
     g: u8,
@@ -57,6 +58,118 @@ struct Diff {
     dg: i8,
     db: i8,
     da: i8,
+}
+
+pub enum PixelBuffer {
+    RGBA(Vec<u8>),
+    RGB(Vec<u8>),
+}
+
+impl PixelBuffer {
+    pub fn new(channels: Channels) -> PixelBuffer {
+        match channels {
+            Channels::RGBA => PixelBuffer::RGBA(Vec::new()),
+            Channels::RGB => PixelBuffer::RGB(Vec::new()),
+        }
+    }
+
+    pub fn wrap(channels: Channels, vec: Vec<u8>) -> PixelBuffer {
+        match channels {
+            Channels::RGBA => PixelBuffer::RGBA(vec),
+            Channels::RGB => PixelBuffer::RGB(vec),
+        }
+    }
+
+    /*
+     * Destroy the wrapper and return the internal buffer
+     */
+    pub fn untyped_vec(self) -> Vec<u8> {
+        match self {
+            PixelBuffer::RGBA(v) => v,
+            PixelBuffer::RGB(v) => v,
+        }
+    }
+
+    pub fn pixel_count(&self) -> usize {
+        match self {
+            PixelBuffer::RGBA(vec) => vec.len() / 4,
+            PixelBuffer::RGB(vec) => vec.len() / 3,
+        }
+    }
+
+    fn push(&mut self, value: RGBA) {
+        match self {
+            PixelBuffer::RGBA(v) => {
+                push_rgba(v, value);
+            }
+            PixelBuffer::RGB(v) => {
+                push_rgb(v, value);
+            }
+        }
+    }
+
+    fn into_iter(self) -> Box<dyn PixelIterator> {
+        match self {
+            PixelBuffer::RGBA(vec) => Box::new(RGBAIterator {
+                iter: Box::new(vec.into_iter()),
+            }),
+            PixelBuffer::RGB(vec) => Box::new(RGBIterator {
+                iter: Box::new(vec.into_iter()),
+            }),
+        }
+    }
+}
+
+trait PixelIterator: Iterator<Item = Result<RGBA, QOIError>> {}
+
+impl PixelIterator for RGBAIterator {}
+impl PixelIterator for RGBIterator {}
+
+struct RGBAIterator {
+    iter: Box<dyn Iterator<Item = u8>>,
+}
+struct RGBIterator {
+    iter: Box<dyn Iterator<Item = u8>>,
+}
+
+impl Iterator for RGBAIterator {
+    type Item = Result<RGBA, QOIError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        // If there is nothing left in the iterator, then return None
+        let bytes: Vec<u8> = self.iter.by_ref().take(4).collect();
+        if bytes.is_empty() {
+            return None;
+        } else if bytes.len() != 4 {
+            return Some(Err(QOIError::UnalignedRGBA));
+        };
+
+        Some(Ok(RGBA {
+            r: bytes[0],
+            g: bytes[1],
+            b: bytes[2],
+            a: bytes[3],
+        }))
+    }
+}
+
+impl Iterator for RGBIterator {
+    type Item = Result<RGBA, QOIError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        // If there is nothing left in the iterator, then return None
+        let bytes: Vec<u8> = self.iter.by_ref().take(3).collect();
+        if bytes.is_empty() {
+            return None;
+        } else if bytes.len() != 3 {
+            return Some(Err(QOIError::UnalignedRGBA));
+        };
+
+        Some(Ok(RGBA {
+            r: bytes[0],
+            g: bytes[1],
+            b: bytes[2],
+            a: 255,
+        }))
+    }
 }
 
 impl std::ops::Sub for RGBA {
@@ -73,6 +186,7 @@ impl std::ops::Sub for RGBA {
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
+#[allow(clippy::upper_case_acronyms)]
 enum Op {
     Index { index: usize },
     Diff { dr: i8, dg: i8, db: i8 },
@@ -134,6 +248,7 @@ pub enum QOIError {
     UnalignedRGBA,
     TooMuchInput,
     MissingMagic,
+    MisMatchedChannels,
     InvalidChannelSpec,
     InvalidColorSpaceSpec,
     CompressionError(String),
@@ -164,6 +279,8 @@ impl std::fmt::Debug for QOIError {
                     tmp = format!("Internal Error while decompressing: {}", s);
                     &tmp
                 }
+                QOIError::MisMatchedChannels =>
+                    "Incorrect PixelBuffer type passed to encode for given header",
             }
         )
     }
@@ -186,6 +303,7 @@ fn hash(pixel: RGBA) -> usize {
     ) % 64)
         .into()
 }
+
 fn push_rgba(vec: &mut Vec<u8>, pixel: RGBA) {
     vec.push(pixel.r);
     vec.push(pixel.g);
@@ -236,9 +354,9 @@ pub fn parse_header<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<Head
 // TODO: Change this to an iterator API
 // Or a generator when generators get mainlined
 pub fn decode<'a>(
-    params: Header,
+    header: Header,
     qoi: &mut impl Iterator<Item = &'a u8>,
-) -> Result<Vec<u8>, QOIError> {
+) -> Result<PixelBuffer, QOIError> {
     let mut previous = RGBA {
         r: 0,
         g: 0,
@@ -251,20 +369,14 @@ pub fn decode<'a>(
         b: 0,
         a: 0,
     }; 64];
-    let mut output = vec![];
+    let mut output = PixelBuffer::new(header.channels);
 
     let iter = qoi;
 
-    let total: u32 = params.width * params.height * (params.channels as u32);
-
-    let push = if params.channels == Channels::RGBA {
-        push_rgba
-    } else {
-        push_rgb
-    };
+    let total = (header.width * header.height) as usize;
 
     while let Some(qoi_byte) = iter.next() {
-        if output.len() >= total.try_into().unwrap() {
+        if output.pixel_count() >= total {
             break;
         }
         let op: Op = (*qoi_byte).into();
@@ -292,7 +404,7 @@ pub fn decode<'a>(
                 // Don't make the off-by-one correction here, since we are always returning an
                 // extra pixel to be pushed by the containing block
                 for _ in 0..(run - 1) {
-                    push(&mut output, previous);
+                    output.push(previous);
                 }
                 previous
             }
@@ -311,44 +423,25 @@ pub fn decode<'a>(
         };
         previous = current;
         lookup_table[hash(current)] = current;
-        push(&mut output, current);
+        output.push(current);
     }
     Ok(output)
 }
 
-fn get_rgba<'a>(iter: &mut impl Iterator<Item = &'a u8>) -> Result<Option<RGBA>, QOIError> {
-    // If there is nothing left in the iterator, then return None
-    let r = iter.next();
-    if r.is_none() {
-        return Ok(None);
+pub fn encode(header: Header, bitmap: PixelBuffer) -> Result<Vec<u8>, QOIError> {
+    match &bitmap {
+        PixelBuffer::RGBA(_) => {
+            if header.channels == Channels::RGB {
+                return Err(QOIError::MisMatchedChannels);
+            }
+        }
+        PixelBuffer::RGB(_) => {
+            if header.channels == Channels::RGBA {
+                return Err(QOIError::MisMatchedChannels);
+            }
+        }
     }
 
-    // Otherwise return an Unaligned error to indicate that the stream is malformed
-    Ok(Some(RGBA {
-        r: *r.unwrap(),
-        g: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
-        b: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
-        a: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
-    }))
-}
-
-fn get_rgb<'a>(iter: &mut impl Iterator<Item = &'a u8>) -> Result<Option<RGBA>, QOIError> {
-    let r = iter.next();
-    if r.is_none() {
-        return Ok(None);
-    }
-
-    Ok(Some(RGBA {
-        r: *r.unwrap(),
-        g: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
-        b: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
-        a: 255,
-    }))
-}
-pub fn encode<'a>(
-    header: Header,
-    bitmap: &mut impl Iterator<Item = &'a u8>,
-) -> Result<Vec<u8>, QOIError> {
     let mut previous = RGBA {
         r: 0,
         g: 0,
@@ -363,14 +456,11 @@ pub fn encode<'a>(
     }; 64];
 
     let mut output: Vec<u8> = header.into();
-    let mut iter = bitmap;
+
+    let mut iter = bitmap.into_iter();
 
     let total = header.width * header.height;
-    let get_pixel = if header.channels == Channels::RGBA {
-        get_rgba
-    } else {
-        get_rgb
-    };
+
     let mut num_pixels = 0;
     loop {
         if num_pixels == total {
@@ -386,8 +476,8 @@ pub fn encode<'a>(
                 "Encoded too many pixels into QOI".to_owned(),
             ));
         }
-        let mut pixel = match get_pixel(&mut iter)? {
-            Some(p) => p,
+        let mut pixel: RGBA = match iter.next() {
+            Some(p) => p?,
             None => {
                 dbg!(num_pixels);
                 return Err(QOIError::EndOfStream);
@@ -395,9 +485,13 @@ pub fn encode<'a>(
         };
 
         let mut run = 0;
-        let mut next = Some(pixel);
-        while next.is_some() && next.unwrap() == previous {
-            next = get_pixel(&mut iter)?;
+        let mut next: Option<RGBA> = Some(pixel);
+        while next.is_some() && (next.unwrap()) == previous {
+            let result = iter.next();
+            next = match result {
+                Some(r) => Some(r?),
+                None => None,
+            };
             run += 1;
         }
 
