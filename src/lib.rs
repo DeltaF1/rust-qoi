@@ -136,10 +136,13 @@ pub enum QOIError {
     MissingMagic,
     InvalidChannelSpec,
     InvalidColorSpaceSpec,
+    CompressionError(String),
+    DecompressionError(String),
 }
 
 impl std::fmt::Debug for QOIError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        let tmp;
         write!(
             f,
             "{}",
@@ -153,6 +156,14 @@ impl std::fmt::Debug for QOIError {
                 QOIError::InvalidColorSpaceSpec =>
                     "Invalid color space, expected sRGB (0) or linear (1)", // TODO: Capture the invalid byte in enum
                 QOIError::UnalignedRGBA => "Input was not aligned to 4-byte RGBA",
+                QOIError::CompressionError(s) => {
+                    tmp = format!("Internal Error while compressing: {}", s);
+                    &tmp
+                }
+                QOIError::DecompressionError(s) => {
+                    tmp = format!("Internal Error while decompressing: {}", s);
+                    &tmp
+                }
             }
         )
     }
@@ -246,7 +257,11 @@ pub fn decode<'a>(
 
     let total: u32 = params.width * params.height * (params.channels as u32);
 
-    let push = if params.channels == Channels::RGBA { push_rgba } else { push_rgb };
+    let push = if params.channels == Channels::RGBA {
+        push_rgba
+    } else {
+        push_rgb
+    };
 
     while let Some(qoi_byte) = iter.next() {
         if output.len() >= total.try_into().unwrap() {
@@ -351,14 +366,25 @@ pub fn encode<'a>(
     let mut iter = bitmap;
 
     let total = header.width * header.height;
-    let get_pixel = if header.channels == Channels::RGBA { get_rgba } else { get_rgb };
-    println!("total pixels to encode: {}", total);
+    let get_pixel = if header.channels == Channels::RGBA {
+        get_rgba
+    } else {
+        get_rgb
+    };
     let mut num_pixels = 0;
     loop {
-        if num_pixels >= total {
-            println!("Early break!");
-            println!("{} left in iter", iter.count());
-            break;
+        if num_pixels == total {
+            if iter.count() == 0 {
+                break;
+            } else {
+                return Err(QOIError::TooMuchInput);
+            }
+        }
+
+        if num_pixels > total {
+            return Err(QOIError::CompressionError(
+                "Encoded too many pixels into QOI".to_owned(),
+            ));
         }
         let mut pixel = match get_pixel(&mut iter)? {
             Some(p) => p,
