@@ -28,7 +28,7 @@ impl From<Header> for Vec<u8> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(u8)]
 pub enum Channels {
     RGB = 3,
@@ -191,6 +191,7 @@ fn write_qoi(vec: &mut Vec<u8>, op: Op) {
     vec.push(op.into());
 }
 
+// TODO: Include this in the decode function?
 pub fn parse_header<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<Header, QOIError> {
     let magic = bytes.by_ref().take(4).cloned().collect::<Vec<u8>>();
     if magic.len() != 4 {
@@ -222,6 +223,7 @@ pub fn parse_header<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<Head
 }
 
 // TODO: Change this to an iterator API
+// Or a generator when generators get mainlined
 pub fn decode<'a>(
     params: Header,
     qoi: &mut impl Iterator<Item = &'a u8>,
@@ -243,6 +245,8 @@ pub fn decode<'a>(
     let iter = qoi;
 
     let total: u32 = params.width * params.height * (params.channels as u32);
+
+    let push = if params.channels == Channels::RGBA { push_rgba } else { push_rgb };
 
     while let Some(qoi_byte) = iter.next() {
         if output.len() >= total.try_into().unwrap() {
@@ -273,7 +277,7 @@ pub fn decode<'a>(
                 // Don't make the off-by-one correction here, since we are always returning an
                 // extra pixel to be pushed by the containing block
                 for _ in 0..(run - 1) {
-                    push_rgba(&mut output, previous);
+                    push(&mut output, previous);
                 }
                 previous
             }
@@ -292,7 +296,7 @@ pub fn decode<'a>(
         };
         previous = current;
         lookup_table[hash(current)] = current;
-        push_rgba(&mut output, current);
+        push(&mut output, current);
     }
     Ok(output)
 }
@@ -304,7 +308,7 @@ fn get_rgba<'a>(iter: &mut impl Iterator<Item = &'a u8>) -> Result<Option<RGBA>,
         return Ok(None);
     }
 
-    // Otherwise return an EndOfStream error to indicate that the stream is malformed
+    // Otherwise return an Unaligned error to indicate that the stream is malformed
     Ok(Some(RGBA {
         r: *r.unwrap(),
         g: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
@@ -313,6 +317,19 @@ fn get_rgba<'a>(iter: &mut impl Iterator<Item = &'a u8>) -> Result<Option<RGBA>,
     }))
 }
 
+fn get_rgb<'a>(iter: &mut impl Iterator<Item = &'a u8>) -> Result<Option<RGBA>, QOIError> {
+    let r = iter.next();
+    if r.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(RGBA {
+        r: *r.unwrap(),
+        g: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
+        b: *iter.next().ok_or(QOIError::UnalignedRGBA)?,
+        a: 255,
+    }))
+}
 pub fn encode<'a>(
     header: Header,
     bitmap: &mut impl Iterator<Item = &'a u8>,
@@ -334,6 +351,7 @@ pub fn encode<'a>(
     let mut iter = bitmap;
 
     let total = header.width * header.height;
+    let get_pixel = if header.channels == Channels::RGBA { get_rgba } else { get_rgb };
     println!("total pixels to encode: {}", total);
     let mut num_pixels = 0;
     loop {
@@ -342,9 +360,10 @@ pub fn encode<'a>(
             println!("{} left in iter", iter.count());
             break;
         }
-        let mut pixel = match get_rgba(&mut iter)? {
+        let mut pixel = match get_pixel(&mut iter)? {
             Some(p) => p,
             None => {
+                dbg!(num_pixels);
                 return Err(QOIError::EndOfStream);
             }
         };
@@ -352,7 +371,7 @@ pub fn encode<'a>(
         let mut run = 0;
         let mut next = Some(pixel);
         while next.is_some() && next.unwrap() == previous {
-            next = get_rgba(&mut iter)?;
+            next = get_pixel(&mut iter)?;
             run += 1;
         }
 

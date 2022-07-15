@@ -11,7 +11,7 @@ fn main() -> Result<(), std::io::Error> {
         bitmap.len(),
         "Didn't decode to the correct length"
     );
-    fs::write("output.raw", &bitmap)?;
+    fs::write(format!("output.{}", if header.channels == qoi::Channels::RGBA { "rgba" } else { "rgb" }), &bitmap)?;
     dbg!(bitmap.len());
     let output = qoi::encode(header, &mut bitmap.iter()).unwrap();
     fs::write("output.qoi", output).expect("Unable to write file");
