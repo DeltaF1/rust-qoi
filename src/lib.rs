@@ -128,6 +128,7 @@ impl PixelIterator for RGBIterator {}
 struct RGBAIterator {
     iter: Box<dyn Iterator<Item = u8>>,
 }
+
 struct RGBIterator {
     iter: Box<dyn Iterator<Item = u8>>,
 }
@@ -320,8 +321,7 @@ fn write_qoi(vec: &mut Vec<u8>, op: Op) {
     vec.push(op.into());
 }
 
-// TODO: Include this in the decode function?
-pub fn parse_header<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<Header, QOIError> {
+fn parse_header<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<Header, QOIError> {
     let magic = bytes.by_ref().take(4).cloned().collect::<Vec<u8>>();
     if magic.len() != 4 {
         return Err(QOIError::EndOfStream);
@@ -354,9 +354,8 @@ pub fn parse_header<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<Head
 // TODO: Change this to an iterator API
 // Or a generator when generators get mainlined
 pub fn decode<'a>(
-    header: Header,
     qoi: &mut impl Iterator<Item = &'a u8>,
-) -> Result<PixelBuffer, QOIError> {
+) -> Result<(Header, PixelBuffer), QOIError> {
     let mut previous = RGBA {
         r: 0,
         g: 0,
@@ -369,6 +368,8 @@ pub fn decode<'a>(
         b: 0,
         a: 0,
     }; 64];
+    let header = parse_header(qoi)?;
+
     let mut output = PixelBuffer::new(header.channels);
 
     let iter = qoi;
@@ -425,7 +426,7 @@ pub fn decode<'a>(
         lookup_table[hash(current)] = current;
         output.push(current);
     }
-    Ok(output)
+    Ok((header, output))
 }
 
 pub fn encode(header: Header, bitmap: PixelBuffer) -> Result<Vec<u8>, QOIError> {
