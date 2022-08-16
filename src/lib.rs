@@ -1,3 +1,31 @@
+//! Implementation of the [QOI image format](https://qoiformat.org).
+//!
+//! See the official [specification](https://qoiformat.org/qoi-specification.pdf) for further
+//! reference.
+//!
+//! # Examples
+//!
+//! ```
+//! use std::fs;
+//!
+//! let input_image = qoi::PixelBuffer::wrap(qoi::Channels::RGBA, fs::read("input.rgba")?);
+//!
+//! let header = qoi::Header {
+//!     width: 256,
+//!     height: 256,
+//!     channels: qoi::Channels::RGBA,
+//!     colorspace: qoi::ColorSpace::Linear
+//! };
+//!
+//! let compressed = qoi::encode(header, input_image)?;
+//!
+//! fs::write("output.qoi", compressed)?;
+//! ```
+
+use std::error::Error;
+use std::fmt::Debug;
+
+/// Stores information about the QOI encoded image
 #[derive(Clone, Copy, Debug)]
 pub struct Header {
     pub width: u32,
@@ -18,6 +46,7 @@ impl Default for Header {
 }
 
 impl From<Header> for Vec<u8> {
+    /// Encode the header into its 14-byte representation
     fn from(header: Header) -> Vec<u8> {
         let mut v = vec![b'q', b'o', b'i', b'f'];
         v.extend(header.width.to_be_bytes());
@@ -31,7 +60,10 @@ impl From<Header> for Vec<u8> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(u8)]
 pub enum Channels {
+    /// Describes a file with byte layout `r | g | b | r | g | b`, omitting alpha values
     RGB = 3,
+
+    /// Describes a file with byte layout `r | g | b | a | r | g | b | a`
     RGBA = 4,
 }
 
@@ -60,12 +92,15 @@ struct Diff {
     da: i8,
 }
 
+/// Wrapper around a raw byte buffer. This type is necessary to allow the
+/// [encoder](encode) to parse bytes correctly.
 pub enum PixelBuffer {
     RGBA(Vec<u8>),
     RGB(Vec<u8>),
 }
 
 impl PixelBuffer {
+    /// Create an empty PixelBuffer with the given byte layout.
     pub fn new(channels: Channels) -> PixelBuffer {
         match channels {
             Channels::RGBA => PixelBuffer::RGBA(Vec::new()),
@@ -73,6 +108,7 @@ impl PixelBuffer {
         }
     }
 
+    /// Convenience method to wrap an existing buffer into the type.
     pub fn wrap(channels: Channels, vec: Vec<u8>) -> PixelBuffer {
         match channels {
             Channels::RGBA => PixelBuffer::RGBA(vec),
@@ -80,20 +116,28 @@ impl PixelBuffer {
         }
     }
 
-    /*
-     * Destroy the wrapper and return the internal buffer
-     */
-    pub fn untyped_vec(self) -> Vec<u8> {
+    
+    /// Destroy the wrapper and return the internal buffer.
+    pub fn into_vec(self) -> Vec<u8> {
         match self {
             PixelBuffer::RGBA(v) => v,
             PixelBuffer::RGB(v) => v,
         }
     }
 
+    /// Return the number of pixels contained within the buffer.
+    /// Access to the raw buffer length is not permitted.
     pub fn pixel_count(&self) -> usize {
         match self {
             PixelBuffer::RGBA(vec) => vec.len() / 4,
             PixelBuffer::RGB(vec) => vec.len() / 3,
+        }
+    }
+
+    fn get_channels(&self) -> Channels {
+        match self {
+            PixelBuffer::RGBA(_) => Channels::RGBA,
+            PixelBuffer::RGB(_) => Channels::RGB,
         }
     }
 
@@ -243,11 +287,19 @@ impl From<Op> for u8 {
     }
 }
 
-#[derive(PartialEq)]
+/// Error class for errors during encoding/decoding
+#[derive(PartialEq, Debug)]
 pub enum QOIError {
+    /// The input to the method ran out unexpectedly
     EndOfStream,
+
+    /// The input pixelbuffer contained a number of bytes that does not fit into RGB(A) tuples
     UnalignedRGBA,
+
+    /// More input was provided than expected for the given image size
     TooMuchInput,
+
+    /// The QOI file does not start with the magic string `qoif`
     MissingMagic,
     MisMatchedChannels,
     InvalidChannelSpec,
@@ -256,7 +308,9 @@ pub enum QOIError {
     DecompressionError(String),
 }
 
-impl std::fmt::Debug for QOIError {
+impl Error for QOIError {}
+
+impl std::fmt::Display for QOIError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         let tmp;
         write!(
@@ -321,29 +375,24 @@ fn write_qoi(vec: &mut Vec<u8>, op: Op) {
     vec.push(op.into());
 }
 
-fn parse_header<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<Header, QOIError> {
-    let magic = bytes.by_ref().take(4).cloned().collect::<Vec<u8>>();
-    if magic.len() != 4 {
+fn parse_header<'a>(bytes: impl IntoIterator<Item = u8>) -> Result<Header, QOIError> {
+    let header_bytes = bytes.into_iter().take(14).collect::<Vec<u8>>();
+    if header_bytes.len() != 14 {
         return Err(QOIError::EndOfStream);
     };
-    if magic != b"qoif" {
+    if &header_bytes[0..4] != b"qoif" {
         return Err(QOIError::MissingMagic);
     };
 
-    let header_bytes = bytes.by_ref().take(10).cloned().collect::<Vec<u8>>();
-    if header_bytes.len() != 10 {
-        return Err(QOIError::EndOfStream);
-    }
-
     Ok(Header {
-        width: u32::from_be_bytes(header_bytes[0..4].try_into().unwrap()),
-        height: u32::from_be_bytes(header_bytes[4..8].try_into().unwrap()),
-        channels: match header_bytes[8] {
+        width: u32::from_be_bytes(header_bytes[4..8].try_into().unwrap()),
+        height: u32::from_be_bytes(header_bytes[8..12].try_into().unwrap()),
+        channels: match header_bytes[12] {
             3 => Channels::RGB,
             4 => Channels::RGBA,
             _ => return Err(QOIError::InvalidChannelSpec),
         },
-        colorspace: match header_bytes[9] {
+        colorspace: match header_bytes[13] {
             0 => ColorSpace::sRGB,
             1 => ColorSpace::Linear,
             _ => return Err(QOIError::InvalidColorSpaceSpec),
@@ -353,8 +402,19 @@ fn parse_header<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<Header, 
 
 // TODO: Change this to an iterator API
 // Or a generator when generators get mainlined
+/// Decode a QOI file into the resultant PixelBuffer
+///
+/// # Examples
+///
+/// ```
+/// let qoi_file = fs::read("input.qoi")?;
+/// let (header, buffer) = qoi::decode(qoi_file.into_iter());
+///
+/// // Pass the decoded raw buffer into a process expecting pixel values
+/// example::display_rgba((header.width, header.size), buffer.into_vec());
+/// ```
 pub fn decode<'a>(
-    qoi: &mut impl Iterator<Item = &'a u8>,
+    qoi: impl IntoIterator<Item = u8>,
 ) -> Result<(Header, PixelBuffer), QOIError> {
     let mut previous = RGBA {
         r: 0,
@@ -368,11 +428,11 @@ pub fn decode<'a>(
         b: 0,
         a: 0,
     }; 64];
-    let header = parse_header(qoi)?;
+    let mut iter = qoi.into_iter();
+    let header = parse_header(&mut iter)?;
 
     let mut output = PixelBuffer::new(header.channels);
 
-    let iter = qoi;
 
     let total = (header.width * header.height) as usize;
 
@@ -380,7 +440,7 @@ pub fn decode<'a>(
         if output.pixel_count() >= total {
             break;
         }
-        let op: Op = (*qoi_byte).into();
+        let op: Op = (qoi_byte).into();
         let current = match op {
             Op::Index { index } => lookup_table[index],
             Op::Diff { dr, dg, db } => RGBA {
@@ -410,16 +470,16 @@ pub fn decode<'a>(
                 previous
             }
             Op::RGB => RGBA {
-                r: *iter.next().ok_or(QOIError::EndOfStream)?,
-                g: *iter.next().ok_or(QOIError::EndOfStream)?,
-                b: *iter.next().ok_or(QOIError::EndOfStream)?,
+                r: iter.next().ok_or(QOIError::EndOfStream)?,
+                g: iter.next().ok_or(QOIError::EndOfStream)?,
+                b: iter.next().ok_or(QOIError::EndOfStream)?,
                 a: previous.a,
             },
             Op::RGBA => RGBA {
-                r: *iter.next().ok_or(QOIError::EndOfStream)?,
-                g: *iter.next().ok_or(QOIError::EndOfStream)?,
-                b: *iter.next().ok_or(QOIError::EndOfStream)?,
-                a: *iter.next().ok_or(QOIError::EndOfStream)?,
+                r: iter.next().ok_or(QOIError::EndOfStream)?,
+                g: iter.next().ok_or(QOIError::EndOfStream)?,
+                b: iter.next().ok_or(QOIError::EndOfStream)?,
+                a: iter.next().ok_or(QOIError::EndOfStream)?,
             },
         };
         previous = current;
@@ -430,17 +490,8 @@ pub fn decode<'a>(
 }
 
 pub fn encode(header: Header, bitmap: PixelBuffer) -> Result<Vec<u8>, QOIError> {
-    match &bitmap {
-        PixelBuffer::RGBA(_) => {
-            if header.channels == Channels::RGB {
-                return Err(QOIError::MisMatchedChannels);
-            }
-        }
-        PixelBuffer::RGB(_) => {
-            if header.channels == Channels::RGBA {
-                return Err(QOIError::MisMatchedChannels);
-            }
-        }
+    if !(bitmap.get_channels() == header.channels) {
+        return Err(QOIError::MisMatchedChannels);
     }
 
     let mut previous = RGBA {

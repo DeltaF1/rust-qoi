@@ -3,8 +3,7 @@ use std::fs;
 
 fn main() -> Result<(), std::io::Error> {
     let input_buffer = fs::read("input.qoi")?;
-    let mut input_iter = input_buffer.iter();
-    let (header, bitmap) = qoi::decode(&mut input_iter).unwrap();
+    let (header, bitmap) = qoi::decode(input_buffer.into_iter()).unwrap();
     assert_eq!(
         (header.width * header.height) as usize,
         bitmap.pixel_count(),
